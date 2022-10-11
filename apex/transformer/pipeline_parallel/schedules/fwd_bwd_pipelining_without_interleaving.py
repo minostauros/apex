@@ -1,3 +1,4 @@
+import contextlib
 from typing import Union, List, Optional, Sequence
 import warnings
 
@@ -55,28 +56,31 @@ def get_tensor_shapes(
     assert (
         len(tensor_shape) == 3
     ), f"`tensor_shape` should be [sequence_length, micro_batch_size, hidden_size] but {tensor_shape}"
+
     sequence_length, micro_batch_size, hidden_size = tensor_shape
-    seq_len = sequence_length
-    if sequence_parallel_enabled:
-        seq_len = sequence_length // parallel_state.get_tensor_model_parallel_world_size()
+
     tensor_shapes = []
-    if model_type == ModelType.encoder_and_decoder:
-        if decoder_sequence_length is None:
-            raise ValueError("`decoder_sequence_length` is required for `ModelType.encoder_and_decoder`")
-        dec_seq_len = decoder_sequence_length
-        if sequence_parallel_enabled:
-            dec_seq_len = decoder_sequence_length // parallel_state.get_tensor_model_parallel_world_size()
-        if parallel_state.is_pipeline_stage_before_split(rank):
-            # If next rank is after split, then need transpose for encoder_hidden_state.
-            if parallel_state.is_pipeline_stage_before_split(rank + 1):
-                tensor_shapes.append((seq_len, micro_batch_size, hidden_size))
-            else:
-                tensor_shapes.append((dec_seq_len, micro_batch_size, hidden_size))
-        else:
-            tensor_shapes.append((dec_seq_len, micro_batch_size, hidden_size))
-            tensor_shapes.append((seq_len, micro_batch_size, hidden_size))
+
+    if sequence_parallel_enabled:
+        seq_length = sequence_length // parallel_state.get_tensor_model_parallel_world_size()
     else:
-        tensor_shapes.append((seq_len, micro_batch_size, hidden_size))
+        seq_length = sequence_length
+
+    if model_type == ModelType.encoder_and_decoder:
+
+        if sequence_parallel_enabled:
+            dec_seq_length = decoder_sequence_length // parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            dec_seq_length = decoder_sequence_length
+
+        if parallel_state.is_pipeline_stage_before_split(rank):
+            tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+        else:
+            tensor_shapes.append((dec_seq_length, micro_batch_size, hidden_size))
+            tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+    else:
+        tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+
     return tensor_shapes
 
 
@@ -236,6 +240,7 @@ def forward_backward_pipelining_without_interleaving(
     deallocate_pipeline_outputs: bool = False,
     async_comm: bool = False,
     sequence_parallel_enabled: bool = False,
+    custom_sync_context_handler = None,
     **kwargs,
 ) -> List[Union[torch.Tensor, Sequence[torch.Tensor]]]:
     """Run non-interleaved 1F1B schedule, with communication between pipeline stages.
@@ -266,9 +271,18 @@ def forward_backward_pipelining_without_interleaving(
         sequence_parallel_enabled: Set to :obj:`True` for this function to handle sequence length.
             When :obj:`True`, the sequence length on each tensor model parallel rank is updated
             to :math:`original\_sequence\_length / tensor\_model\_parallel\_world\_size`.
+        custom_sync_context_handler: Context manager to disable
+            asynchronous gradient reductions. In the first pipeline
+            stage, asynchronous gradient reductions are enabled in the
+            backward pass of the last microbatch. In other pipeline
+            stages, asynchronous gradient reductions are disabled and
+            gradients must be manually synchronized by the caller (in
+            practice the runtime is covered up by the bubble
+            overhead).
 
     Returns:
         a list of loss `torch.Tensor`s if the last stage, empty list otherwise.
+
     """
     # timers = get_timers()
 
@@ -283,6 +297,15 @@ def forward_backward_pipelining_without_interleaving(
         msg = f"`model` is expected be a `nn.Module`, but {type(model)}"
         raise RuntimeError(msg)
     model: torch.nn.Module = model[0]
+
+    # Disable async grad reductions
+    if custom_sync_context_handler is not None:
+        context_handler = custom_sync_context_handler
+    else:
+        context_handler = contextlib.nullcontext
+    context = context_handler()
+    context.__enter__()
+    context_is_active = True
 
     # Compute number of warmup microbatches.
     num_microbatches: int = get_num_microbatches()
@@ -453,6 +476,9 @@ def forward_backward_pipelining_without_interleaving(
     _logger.info("Cooldown phase")
     if not forward_only:
         for i in range(num_warmup_microbatches):
+            if i == num_warmup_microbatches-1 and rank == 0:
+                context.__exit__(None, None, None)
+                context_is_active = False
             _logger.debug(f"cooldown iter: {i} / {num_warmup_microbatches}")
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
@@ -482,5 +508,10 @@ def forward_backward_pipelining_without_interleaving(
                 async_comm=async_comm,
                 sequence_parallel_enabled=sequence_parallel_enabled,
             )
+
+    # Make sure to exit context handler for async grad reductions
+    if context_is_active:
+        context.__exit__(None, None, None)
+        context_is_active = False
 
     return losses_reduced
