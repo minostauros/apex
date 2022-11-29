@@ -21,6 +21,7 @@ import warnings
 import torch
 
 from apex.transformer.log_util import get_transformer_logger
+from apex.transformer._ucc_util import HAS_UCC
 
 
 _logger = get_transformer_logger(__name__)
@@ -126,7 +127,8 @@ def initialize_model_parallel(
     assert default_backend is None or default_backend in ("nccl", "ucc")
     assert p2p_backend is None or p2p_backend in ("nccl", "ucc")
     if "ucc" in (default_backend, p2p_backend):
-        check_torch_ucc_availability()
+        if not HAS_UCC:
+            raise ImportError("UCC backend requires pytorch source build with UCC installed and enabled")
         warnings.warn("`ucc` backend support is experimental", ExperimentalWarning)
     if default_backend == "ucc":
         warnings.warn("The UCC's functionality as `default_backend` is not well verified", ExperimentalWarning)
@@ -575,6 +577,12 @@ def get_virtual_pipeline_model_parallel_world_size():
     return _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
 
 
+def set_virtual_pipeline_model_parallel_world_size(size):
+    """Return the virtual pipeline-parallel world size."""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = size
+
+
 def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
     in the tensor model parallel group."""
@@ -671,12 +679,3 @@ def destroy_model_parallel():
 
 # Used to warn when the UCC is specified.
 class ExperimentalWarning(Warning): pass
-
-
-def check_torch_ucc_availability() -> None:
-    try:
-        import torch_ucc  # NOQA
-    except ImportError:
-        raise ImportError(
-            "UCC backend requires [torch_ucc](https://github.com/facebookresearch/torch_ucc) but not found"
-        )

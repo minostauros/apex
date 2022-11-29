@@ -30,10 +30,9 @@ from apex.transformer.pipeline_parallel.schedules.fwd_bwd_pipelining_without_int
 )
 from apex.transformer.testing.distributed_test_base import NcclDistributedTestBase
 from apex.transformer.testing.distributed_test_base import UccDistributedTestBase
-from apex.transformer.testing.distributed_test_base import HAS_TORCH_UCC
 from apex.transformer.testing.distributed_test_base import HAS_TORCH_UCC_COMPAT_NVIDIA_DRIVER
 from apex.transformer.testing import commons as testing_utils
-
+from apex.transformer._ucc_util import HAS_UCC
 
 logging.getLogger("torch").setLevel(logging.WARNING)
 logging.getLogger("apex").setLevel(logging.WARNING)
@@ -270,6 +269,7 @@ class PipelineParallelForwardBackwardTestBase:
             sync_batch_comm=sync_batch_comm,
         )
 
+    # fails on native ucc: times out
     @unittest.skipUnless(_get_default_world_sizes_model_parallel_world_size()[-1] > 2, "Interleaved schedule requires pipeline_model_parallel_world_size > 2")
     def test_learning_pipelining_with_interleaving(self, sync_batch_comm: bool = True):
         self._forward_backward_test_impl(
@@ -277,6 +277,7 @@ class PipelineParallelForwardBackwardTestBase:
             sync_batch_comm=sync_batch_comm,
         )
 
+    # fails on native ucc: times out
     @unittest.skipUnless(_get_default_world_sizes_model_parallel_world_size()[-1] > 2, "Interleaved schedule requires pipeline_model_parallel_world_size > 2")
     def test_inference_pipelining_with_interleaving(self, sync_batch_comm: bool = True):
         self._forward_backward_test_impl(
@@ -284,6 +285,7 @@ class PipelineParallelForwardBackwardTestBase:
             sync_batch_comm=sync_batch_comm,
         )
 
+    # fails on native ucc: times out
     @unittest.skipUnless(_get_default_world_sizes_model_parallel_world_size()[-1] > 2, "Interleaved schedule requires pipeline_model_parallel_world_size > 2")
     def test_learning_async_pipelining_with_interleaving(self, sync_batch_comm: bool = True):
         self._forward_backward_test_impl(
@@ -291,6 +293,7 @@ class PipelineParallelForwardBackwardTestBase:
             sync_batch_comm=sync_batch_comm,
         )
 
+    # fails on native ucc: times out
     @unittest.skipUnless(_get_default_world_sizes_model_parallel_world_size()[-1] > 2, "Interleaved schedule requires pipeline_model_parallel_world_size > 2")
     def test_inference_async_pipelining_with_interleaving(self, sync_batch_comm: bool = True):
         self._forward_backward_test_impl(
@@ -313,12 +316,12 @@ class NcclPipelineParallelForwardBackwardTest(NcclDistributedTestBase, PipelineP
 
     @unittest.skipUnless(HAS_TORCH_UCC_COMPAT_NVIDIA_DRIVER, "Needs driver >= 470.42.01")
     def _test_hybrid_backends(self, forward_only: bool) -> None:
-        if HAS_TORCH_UCC:
+        if HAS_UCC:
             self._run_hybrid_distributed_backend(forward_only)
         else:
             with self.assertRaisesRegex(
                 ImportError,
-                re.escape("UCC backend requires [torch_ucc](https://github.com/facebookresearch/torch_ucc) but not found"),
+                re.escape("UCC backend requires pytorch source build with UCC installed and enabled"),
             ):
                 self._run_hybrid_distributed_backend(forward_only)
 
@@ -492,10 +495,9 @@ class NcclPipelineParallelWithToyParallelMLP(NcclDistributedTestBase):
         self._forward_backward_test_impl(forward_only=False, sequence_parallel_enabled=True, model_type=ModelType.encoder_or_decoder, dtype=torch.half)
 
 
-@unittest.skipIf(torch.cuda.device_count() < 4 or torch.cuda.device_count() % 2 != 0, "Requires >= 4 GPUs")
 class NcclPipelineParallelWithCustomSyncContextHandler(NcclDistributedTestBase):
 
-    GLOBAL_BATCH_SIZE = 2
+    GLOBAL_BATCH_SIZE = 32
     MICRO_BATCH_SIZE = 1
     HIDDEN_SIZE = 1
 
@@ -503,19 +505,19 @@ class NcclPipelineParallelWithCustomSyncContextHandler(NcclDistributedTestBase):
     def world_size(self) -> int:
         return min(torch.cuda.device_count(), 8)
 
+    @unittest.skipIf(torch.cuda.device_count() < 2 or torch.cuda.device_count() % 2 != 0, "Requires >= 2 GPUs")
     def test_pipelining_without_interleaving_with_custom_sync_context_handler(self) -> None:
 
         # Parallel configuration
         world_size = torch.cuda.device_count()
         tensor_model_parallel_world_size = 1
-        data_parallel_size = 2
+        data_parallel_size = 2 if world_size > 2 else 1
         pipeline_model_parallel_world_size = world_size // data_parallel_size
 
         # Initialize pipeline parallelism
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size_=tensor_model_parallel_world_size,
             pipeline_model_parallel_size_=pipeline_model_parallel_world_size,
-            virtual_pipeline_model_parallel_size_=None,
         )
         pp_utils._reconfigure_microbatch_calculator(
             rank=parallel_state.get_tensor_model_parallel_rank(),
@@ -544,29 +546,29 @@ class NcclPipelineParallelWithCustomSyncContextHandler(NcclDistributedTestBase):
         model = build_model(
             testing_utils.model_provider_func,
             wrap_with_ddp=True,
-            virtual_pipeline_model_parallel_size=None,
             hidden_size=hidden_size,
         )[0]
         model = model.to(dtype)
         model.module.apply(get_init_weights_func(0))
 
-        # Construct custom context
-        has_entered_context = False
-        has_exited_context = False
-        no_grad_at_context_exit = False
+        # Construct context that destroys all grads on exit
+        has_entered_grad_sync_context = False
+        has_exited_grad_sync_context = False
+        has_called_grad_sync_func = False
         @contextlib.contextmanager
-        def custom_context():
+        def custom_grad_sync_context():
             try:
-                nonlocal has_entered_context
-                has_entered_context = True
+                nonlocal has_entered_grad_sync_context
+                has_entered_grad_sync_context = True
                 yield
             finally:
-                nonlocal has_exited_context, no_grad_at_context_exit
-                has_exited_context = True
-                no_grad_at_context_exit = all(
-                    p.grad is None
-                    for p in model.parameters()
-                )
+                nonlocal has_exited_grad_sync_context
+                has_exited_grad_sync_context = True
+                for param in model.parameters():
+                    param.grad = None
+        def custom_grad_sync_func():
+            nonlocal has_called_grad_sync_func
+            has_called_grad_sync_func = True
 
         # Training step with pipeline parallelism
         loss = forward_backward_pipelining_without_interleaving(
@@ -580,19 +582,130 @@ class NcclPipelineParallelWithCustomSyncContextHandler(NcclDistributedTestBase):
             grad_scaler=None,
             deallocate_pipeline_outputs=False,
             sequence_parallel_enabled=False,
-            custom_sync_context_handler=custom_context,
+            custom_sync_context_handler=custom_grad_sync_context,
+            custom_grad_sync_func=custom_grad_sync_func,
+        )
+        torch.cuda.synchronize()
+
+        # Check if model has initialized gradients
+        has_any_grads = any(param.grad is not None for param in model.parameters())
+        has_all_grads = all(param.grad is not None for param in model.parameters())
+
+        # Check context behavior
+        self.assertTrue(has_entered_grad_sync_context, 'Has not entered custom sync context')
+        self.assertTrue(has_exited_grad_sync_context, 'Has not exited custom sync context')
+        self.assertEqual(
+            has_any_grads,
+            has_all_grads,
+            'Expected gradients to all be uninitialized or all be initialized',
+        )
+        self.assertEqual(
+            has_all_grads,
+            parallel_state.is_pipeline_first_stage(),
+            'Expected gradients to be initialized only in first pipeline stage',
+        )
+
+        # Clean up
+        parallel_state.destroy_model_parallel()
+
+    @unittest.skipIf(torch.cuda.device_count() < 4 or torch.cuda.device_count() % 2 != 0, "Requires >= 4 GPUs")
+    def test_pipelining_with_interleaving_with_custom_sync_context_handler(self) -> None:
+
+        # Parallel configuration
+        world_size = torch.cuda.device_count()
+        tensor_model_parallel_world_size = 1
+        data_parallel_size = 2 if world_size > 4 else 1
+        pipeline_model_parallel_world_size = world_size // data_parallel_size
+        virtual_pipeline_model_parallel_size = 2
+
+        # Initialize pipeline parallelism
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size_=tensor_model_parallel_world_size,
+            pipeline_model_parallel_size_=pipeline_model_parallel_world_size,
+            virtual_pipeline_model_parallel_size_=virtual_pipeline_model_parallel_size,
+        )
+        pp_utils._reconfigure_microbatch_calculator(
+            rank=parallel_state.get_tensor_model_parallel_rank(),
+            rampup_batch_size=None,
+            global_batch_size=self.GLOBAL_BATCH_SIZE,
+            micro_batch_size=self.MICRO_BATCH_SIZE,
+            data_parallel_size=parallel_state.get_data_parallel_world_size(),
+        )
+        pp_utils.update_num_microbatches(0)
+
+        # Construct synthetic data
+        dtype = get_dtype_for_comparison()
+        hidden_size = self.HIDDEN_SIZE
+        microbatch_size = self.MICRO_BATCH_SIZE
+        global_batch_shape = (
+            self.GLOBAL_BATCH_SIZE
+            // parallel_state.get_data_parallel_world_size(),
+            hidden_size,
+            hidden_size,
+        )
+        batch = None
+        if parallel_state.is_pipeline_first_stage():
+            batch = (torch.ones(global_batch_shape, dtype=dtype).cuda(), )
+
+        # Construct model
+        model = build_model(
+            testing_utils.model_provider_func,
+            wrap_with_ddp=True,
+            virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+            hidden_size=hidden_size,
+        )
+        for module in model:
+            module.to(dtype)
+            module.module.apply(get_init_weights_func(0))
+
+        # Construct context that keeps track whenever entered/exited
+        grad_sync_context_enter_count = 0
+        grad_sync_context_exit_count = 0
+        @contextlib.contextmanager
+        def custom_grad_sync_context():
+            try:
+                nonlocal grad_sync_context_enter_count
+                grad_sync_context_enter_count += 1
+                yield
+            finally:
+                nonlocal grad_sync_context_exit_count
+                grad_sync_context_exit_count += 1
+                for module in model:
+                    for param in module.parameters():
+                        param.grad = None
+
+        # Training step with pipeline parallelism
+        loss = _forward_backward_pipelining_with_interleaving(
+            testing_utils.fwd_step_func,
+            batch,
+            model,
+            forward_only=False,
+            tensor_shape=(microbatch_size, hidden_size, hidden_size),
+            dtype=dtype,
+            async_comm=False,
+            grad_scaler=None,
+            deallocate_pipeline_outputs=False,
+            sequence_parallel_enabled=False,
+            custom_sync_context_handler=custom_grad_sync_context,
         )
         torch.cuda.synchronize()
 
         # Check context behavior
-        self.assertTrue(has_entered_context, 'Has not entered custom sync context')
-        self.assertTrue(has_exited_context, 'Has not exited custom sync context')
+        self.assertTrue(
+            grad_sync_context_enter_count > 0,
+            'Has not entered custom sync context',
+        )
         self.assertEqual(
-            no_grad_at_context_exit,
-            parallel_state.is_pipeline_first_stage(),
-            'Expected to exit custom sync context '
-            'before backward pass in first pipeline stage '
-            'and after backward pass in other pipeline stages'
+            grad_sync_context_enter_count,
+            grad_sync_context_exit_count,
+            'Has not entered and exited custom sync context '
+            'the same number of times',
+        )
+        self.assertEqual(
+            grad_sync_context_exit_count,
+            virtual_pipeline_model_parallel_size + 1,
+            'Expected to exit custom sync context once per model chunk '
+            'and once at the function end',
         )
 
         # Clean up
