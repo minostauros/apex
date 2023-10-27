@@ -59,9 +59,9 @@ def _run_p2pops(
 
     need_to_sync = p2p_group.name() != default_group.name()
     reqs = []
+    ops = []
 
-    if batch_p2p_comm:
-        ops = []
+    if batch_p2p_comm and p2p_group.name() == "nccl":
         if tensor_send_prev is not None:
             send_prev_op = torch.distributed.P2POp(
                 op=torch.distributed.isend,
@@ -101,9 +101,9 @@ def _run_p2pops(
             reqs = torch.distributed.batch_isend_irecv(ops)
     else:
         # sync before communication if needed
-        if need_to_sync and any(
+        if need_to_sync and any([
             tensor_send_prev is not None, tensor_recv_prev is not None,
-            tensor_send_next is not None, tensor_recv_next is not None):
+            tensor_send_next is not None, tensor_recv_next is not None]):
             torch.cuda.synchronize()
 
         if tensor_send_prev is not None:
@@ -140,12 +140,18 @@ def _run_p2pops(
             return (None, None, None, None, reqs)
 
         if async_comm:
-            if batch_p2p_comm:
-                assert len(reqs) == len(ops)
-            tensor_send_prev_req = None if tensor_send_prev is None else reqs.pop(0)
-            tensor_recv_prev_req = None if tensor_recv_prev is None else reqs.pop(0)
-            tensor_send_next_req = None if tensor_send_next is None else reqs.pop(0)
-            tensor_recv_next_req = None if tensor_recv_next is None else reqs.pop(0)
+            if len(ops) == 0 or len(reqs) == len(ops):
+                tensor_send_prev_req = None if tensor_send_prev is None else reqs.pop(0)
+                tensor_recv_prev_req = None if tensor_recv_prev is None else reqs.pop(0)
+                tensor_send_next_req = None if tensor_send_next is None else reqs.pop(0)
+                tensor_recv_next_req = None if tensor_recv_next is None else reqs.pop(0)
+            elif len(reqs) == 1:
+                tensor_send_prev_req = None if tensor_send_prev is None else reqs[0]
+                tensor_recv_prev_req = None if tensor_recv_prev is None else reqs[0]
+                tensor_send_next_req = None if tensor_send_next is None else reqs[0]
+                tensor_recv_next_req = None if tensor_recv_next is None else reqs[0]
+            else:
+                assert False, "failed to manage p2p requests and handles"
             return (tensor_send_prev_req, tensor_recv_prev_req, tensor_send_next_req, tensor_recv_next_req, None)
         else:
             for req in reqs:
