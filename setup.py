@@ -329,6 +329,27 @@ if "--cuda_ext" in sys.argv:
         )
     )
 
+    ext_modules.append(
+        CUDAExtension(
+            name="fused_rotary_positional_embedding",
+            sources=[
+                "csrc/megatron/fused_rotary_positional_embedding.cpp",
+                "csrc/megatron/fused_rotary_positional_embedding_cuda.cu",
+            ],
+            include_dirs=[os.path.join(this_dir, "csrc")],
+            extra_compile_args={
+                "cxx": ["-O3"] + version_dependent_macros,
+                "nvcc": [
+                    "-O3",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                ] + version_dependent_macros,
+            },
+        )
+    )
+
     if bare_metal_version >= Version("11.0"):
 
         cc_flag = []
@@ -796,6 +817,20 @@ if "--fused_conv_bias_relu" in sys.argv:
                 extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
             )
         )
+
+
+if "--gpu_direct_storage" in sys.argv:
+    sys.argv.remove("--gpu_direct_storage")
+    raise_if_cuda_home_none("--gpu_direct_storage")
+    ext_modules.append(
+        CUDAExtension(
+            name="_apex_gpu_direct_storage",
+            sources=["apex/contrib/csrc/gpu_direct_storage/gds.cpp", "apex/contrib/csrc/gpu_direct_storage/gds_pybind.cpp"],
+            include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/gpu_direct_storage")],
+            libraries=["cufile"],
+            extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
+        )
+    )
 
 
 setup(

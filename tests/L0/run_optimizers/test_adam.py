@@ -6,6 +6,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.testing._internal.common_device_type import largeTensorTest
 
 try:
     import apex
@@ -231,6 +232,21 @@ class AdamTest(unittest.TestCase):
             optimizer_.zero_grad()
             
             self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
+
+    @largeTensorTest('60GB', 'cuda')
+    def testLargeTensor(self):
+        t = torch.zeros(2359332864, dtype=torch.half, device='cuda')
+        t2 = torch.zeros(2359332864, dtype=torch.half, device='cuda')
+        grad = torch.randn_like(t)
+        t.grad = grad
+        t2.grad = grad
+        params = [t]
+        params2 = [t2]
+        optimizer = apex.optimizers.FusedAdam(params, lr=self.lr)
+        optimizer.step()
+        optimizer2 = torch.optim.Adam(params2, lr=self.lr)
+        torch.testing.assert_close(t, t2)
+        torch.cuda.synchronize()
 
 
 if __name__ == '__main__':
