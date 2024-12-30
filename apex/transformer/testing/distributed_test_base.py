@@ -41,8 +41,13 @@ class DistributedTestBase(common_distributed.MultiProcessTestCase):
     def init_method(self):
         return f"{common_utils.FILE_SCHEMA}{self.file_name}"
 
+    @property
+    def destroy_pg_upon_exit(self) -> bool:
+        # Overriding base test class: do not auto destroy PG upon exit.
+        return False
+
     @classmethod
-    def _run(cls, rank, test_name, file_name, pipe):
+    def _run(cls, rank, test_name, file_name, pipe, **kwargs):
         self = cls(test_name)
         self.assertTrue(torch.cuda.is_available())
         self.assertTrue(hasattr(self, "DISTRIBUTED_BACKEND"))
